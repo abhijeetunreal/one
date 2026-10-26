@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>One — Single Focus</title>
+    <!-- Offline-first asset loader: downloads Tailwind + Google Font ONCE, caches them, then works offline -->
+    <style>html.boot body{visibility:hidden}</style>
+    <script>
+    (function () {
+        var TW_URL = 'https://cdn.tailwindcss.com';
+        var FONT_CSS_URL = 'https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600&display=swap';
+        var DB_NAME = 'one-assets', STORE = 'kv', KEY = 'assets-v1';
+
+        document.documentElement.classList.add('boot');
+
+        /* ---------- IndexedDB cache ---------- */
+        function openDB() {
+            return new Promise(function (res, rej) {
+                var r = indexedDB.open(DB_NAME, 1);
+                r.onupgradeneeded = function () { r.result.createObjectStore(STORE); };
+                r.onsuccess = function () { res(r.result); };
+                r.onerror = function () { rej(r.error); };
+            });
+        }
+        function idbGet(k) {
+            return openDB().then(function (db) {
+                return new Promise(function (res, rej) {
+                    var q = db.transaction(STORE, 'readonly').objectStore(STORE).get(k);
+                    q.onsuccess = function () { res(q.result); };
+                    q.onerror = function () { rej(q.error); };
+                });
+            });
+        }
+        function idbSet(k, v) {
+            return openDB().then(function (db) {
+                return new Promise(function (res, rej) {
+                    var tx = db.transaction(STORE, 'readwrite');
+                    tx.objectStore(STORE).put(v, k);
+                    tx.oncomplete = function () { res(); };
+                    tx.onerror = function () { rej(tx.error); };
+                });
+            });
+        }
+
+        /* ---------- Download ---------- */
+        function fetchT(url, type) {
+            var ctrl = new AbortController();
+            var t = setTimeout(function () { ctrl.abort(); }, 25000);
+            return fetch(url, { signal: ctrl.signal }).then(function (r) {
+                clearTimeout(t);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return type === 'blob' ? r.blob() : r.text();
+            });
+        }
+        function blobToDataURL(b) {
+            return new Promise(function (res, rej) {
+                var fr = new FileReader();
+                fr.onload = function () { res(fr.result); };
+                fr.onerror = function () { rej(fr.error); };
+                fr.readAsDataURL(b);
+            });
+        }
+        function download() {
+            var out = {};
+            return fetchT(TW_URL, 'text').then(function (tw) {
+                if (!tw || tw.length < 10000) throw new Error('Bad Tailwind payload');
+                out.tw = tw;
+                return fetchT(FONT_CSS_URL, 'text');
+            }).then(function (css) {
+                var urls = [], m, re = /url\((https:[^)]+)\)/g;
+                while ((m = re.exec(css))) { if (urls.indexOf(m[1]) < 0) urls.push(m[1]); }
+                return Promise.all(urls.map(function (u) {
+                    return fetchT(u, 'blob').then(blobToDataURL).then(function (d) { return [u, d]; });
+                })).then(function (pairs) {
+                    pairs.forEach(function (p) { css = css.split(p[0]).join(p[1]); });
+                    out.css = css;
+                    return out;
+                });
+            });
+        }
+
+        /* ---------- "Connect to internet" gate (first launch only) ---------- */
+        var gate = null;
+        function showGate(state) {
+            if (!gate) {
+                gate = document.createElement('div');
+                gate.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;background:#fff;color:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;text-transform:uppercase;';
+                gate.innerHTML =
+                    '<div style="font-size:12px;letter-spacing:.25em;opacity:.6">O N E</div>' +
+                    '<div id="bg-title" style="font-size:18px;font-weight:300;letter-spacing:.25em;margin-top:32px"></div>' +
+                    '<div id="bg-msg" style="font-size:11px;letter-spacing:.15em;line-height:1.9;color:#64748b;margin-top:16px;max-width:320px"></div>' +
+                    '<button id="bg-retry" type="button" style="margin-top:32px;background:#0f172a;color:#fff;border:0;border-radius:12px;padding:12px 28px;font-size:11px;letter-spacing:.15em;text-transform:uppercase;cursor:pointer">Retry</button>';
+                document.documentElement.appendChild(gate);
+            }
+            var T = {
+                offline: ['Connect to internet', 'First launch needs a one-time download of styles and fonts. Connect to the internet to continue. This is only needed once.'],
+                loading: ['Downloading', 'Setting things up. This happens only once.'],
+                error:   ['Download failed', 'Could not reach the servers. Check your connection and retry.']
+            }[state];
+            gate.querySelector('#bg-title').textContent = T[0];
+            gate.querySelector('#bg-msg').textContent = T[1];
+            gate.querySelector('#bg-retry').style.display = state === 'loading' ? 'none' : 'inline-block';
+        }
+        function waitRetry() {
+            return new Promise(function (res) {
+                var done = false;
+                function fin() {
+                    if (done) return; done = true;
+                    window.removeEventListener('online', fin);
+                    clearTimeout(timer);
+                    res();
+                }
+                var timer = setTimeout(fin, 6000);
+                window.addEventListener('online', fin);
+                var b = gate && gate.querySelector('#bg-retry');
+                if (b) b.onclick = fin;
+            });
+        }
+        function acquire() {
+            showGate(navigator.onLine ? 'loading' : 'offline');
+            return download().catch(function () {
+                showGate(navigator.onLine ? 'error' : 'offline');
+                return waitRetry().then(acquire);
+            });
+        }
+
+        /* ---------- Apply cached assets ---------- */
+        function apply(a) {
+            var st = document.createElement('style');
+            st.textContent = a.css;
+            document.head.appendChild(st);
+            var sc = document.createElement('script');
+            sc.textContent = a.tw;
+            document.head.appendChild(sc);
+            setTimeout(function () {
+                document.documentElement.classList.remove('boot');
+                if (gate) { gate.remove(); gate = null; }
+            }, 120);
+        }
+
+        idbGet(KEY).catch(function () { return null; }).then(function (cached) {
+            if (cached && cached.tw && cached.css) { apply(cached); return; }
+            acquire().then(function (a) {
+                idbSet(KEY, a).catch(function () {});
+                apply(a);
+            });
+        });
+    })();
+    </script>
+    <style>
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: pan-y;
+            transition: background-color 0.4s ease, color 0.4s ease;
+        }
+        .letter-spacing-wide {
+            letter-spacing: 0.25em;
+        }
+        .task-card {
+            transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
+        }
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button { 
+            -webkit-appearance: none; 
+            margin: 0; 
+        }
+    </style>
+</head>
+<body id="app-body" class="bg-white text-slate-900 min-h-screen flex flex-col justify-between p-6 md:p-12 relative overflow-hidden">
+
+    <!-- Ambient background aura -->
+    <div id="aura-bg" class="absolute inset-0 pointer-events-none opacity-30 flex items-center justify-center overflow-hidden transition-all duration-700">
+        <div id="aura-glow" class="w-[500px] h-[500px] rounded-full bg-gradient-to-tr from-slate-200/50 via-blue-100/30 to-purple-100/20 blur-[120px] transition-all duration-700"></div>
+    </div>
+
+    <!-- Top Bar -->
+    <header class="w-full max-w-xl mx-auto flex justify-between items-center z-10 opacity-60 text-xs tracking-widest uppercase">
+        <div class="flex items-center space-x-2">
+            <span id="top-dot" class="inline-block w-1.5 h-1.5 rounded-full bg-slate-900 animate-pulse"></span>
+            <span>O N E</span>
+        </div>
+        <div id="task-counter" class="text-slate-600 cursor-pointer hover:opacity-70 active:scale-95 transform transition-all duration-200" title="View Tasks">0 remaining</div>
+    </header>
+
+    <!-- Main Center Focus Area -->
+    <main class="w-full max-w-xl mx-auto flex-1 flex flex-col items-center justify-center z-10 px-4">
+        
+        <!-- Task Container with Swipe Support -->
+        <div id="task-container" class="w-full flex flex-col items-center justify-center text-center cursor-grab active:cursor-grabbing">
+            <div id="task-card" class="task-card w-full py-12 px-6 flex flex-col items-center justify-center">
+                <h1 id="current-task-text" class="text-2xl md:text-4xl font-light leading-relaxed letter-spacing-wide text-slate-900 uppercase">
+                    Loading...
+                </h1>
+                <!-- Countdown Timer Display -->
+                <div id="task-timer" class="mt-4 text-sm md:text-base font-mono text-slate-600 tracking-widest">
+                    00:00
+                </div>
+                <p id="task-hint" class="mt-8 text-xs text-slate-400 tracking-widest uppercase transition-opacity duration-300">
+                    Swipe right to conquer
+                </p>
+            </div>
+        </div>
+
+        <!-- All Clear State -->
+        <div id="all-clear-state" class="hidden flex flex-col items-center justify-center text-center py-12">
+            <h2 id="all-clear-title" class="text-xl md:text-2xl font-light tracking-[0.3em] text-slate-400 mb-4">A L L   C L E A R</h2>
+            <p id="all-clear-sub" class="text-xs text-slate-500 tracking-widest">Your mind is clear. Add a task below.</p>
+        </div>
+
+    </main>
+
+    <!-- Bottom Controls & Input -->
+    <footer class="w-full max-w-xl mx-auto z-10 flex flex-col space-y-4">
+        <!-- Add Task Input Form -->
+        <form id="add-task-form" class="flex flex-col space-y-3 bg-slate-50 border border-slate-200 rounded-2xl p-3 backdrop-blur-md shadow-xl transition-colors duration-500">
+            <div class="flex items-center">
+                <input type="text" id="new-task-input" placeholder="Type your next focus..." 
+                    class="flex-1 bg-transparent px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:outline-none">
+                <button type="submit" id="add-btn" class="bg-slate-900 text-white text-xs font-medium px-5 py-2.5 rounded-xl tracking-wider uppercase hover:opacity-90 transition-opacity">
+                    Add
+                </button>
+            </div>
+            <!-- Duration Selector -->
+            <div class="flex items-center justify-between px-3 pt-2 border-t border-slate-200/80 text-xs text-slate-500" id="duration-container-border">
+                <span class="tracking-widest uppercase text-[10px]">Duration:</span>
+                
+                <!-- Presets Group -->
+                <div class="flex items-center space-x-1.5" id="duration-selector-group">
+                    <button type="button" class="duration-btn active-preset px-2.5 py-1 rounded-lg bg-slate-900 text-white font-medium text-[11px] transition-all active:scale-95 transform" data-mins="15">15m</button>
+                    <button type="button" class="duration-btn px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 text-[11px] hover:opacity-80 transition-all active:scale-95 transform" data-mins="25">25m</button>
+                    <button type="button" class="duration-btn px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 text-[11px] hover:opacity-80 transition-all active:scale-95 transform" data-mins="45">45m</button>
+                    <button type="button" id="custom-pill-btn" class="duration-btn px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 text-[11px] hover:opacity-80 transition-all active:scale-95 transform" data-mins="custom">Custom</button>
+                </div>
+
+                <!-- Compact Custom Number Input -->
+                <div id="custom-duration-container" class="hidden items-center space-x-1.5">
+                    <input type="number" id="custom-mins-input" min="1" max="1440" value="30" 
+                        class="w-12 bg-white border border-slate-300 text-center text-slate-900 text-xs py-1 rounded-lg focus:outline-none focus:border-slate-500 transition-all">
+                    <span class="text-[11px]">min</span>
+                    <button type="button" id="custom-back-btn" class="text-[10px] underline uppercase tracking-wider hover:opacity-80 ml-1 cursor-pointer active:scale-95 transform transition-all">Presets</button>
+                </div>
+
+                <!-- Compact Custom Number Input -->
+                <div id="custom-duration-container" class="hidden items-center space-x-1.5">
+                    <input type="number" id="custom-mins-input" min="1" max="1440" value="30" 
+                        class="w-12 bg-white border border-slate-300 text-center text-slate-900 text-xs py-1 rounded-lg focus:outline-none focus:border-slate-500">
+                    <span class="text-[11px]">min</span>
+                    <button type="button" id="custom-back-btn" class="text-[10px] underline uppercase tracking-wider hover:opacity-80 ml-1">Presets</button>
+                </div>
+            </div>
+        </form>
+
+        <!-- Quick actions with Theme Toggle showing ONLY next theme hex code -->
+        <div class="flex justify-between items-center text-xs px-2">
+            <button id="theme-toggle-btn" class="font-mono text-xs transition-all uppercase tracking-wider font-bold cursor-pointer active:scale-95 transform"></button>
+            <button id="reset-defaults" class="text-[10px] tracking-widest transition-all uppercase cursor-pointer active:scale-95 transform">Reset queue</button>
+        </div>
+    </footer>
+
+    <!-- Task List Overlay -->
+    <div id="task-list-overlay" class="fixed inset-0 z-50 hidden bg-black/20 backdrop-blur-sm flex-col items-center justify-center p-4 opacity-0 transition-opacity duration-500">
+        <div id="task-list-modal" class="w-full max-w-md shadow-2xl rounded-2xl p-6 max-h-[80vh] flex flex-col transform origin-top-right scale-0 opacity-0 translate-x-16 -translate-y-16 transition-all duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1.1)]">
+            <div class="flex justify-between items-center mb-6 shrink-0">
+                <h2 class="text-sm font-semibold tracking-widest uppercase">Task Overview</h2>
+                <button id="close-overlay-btn" class="text-xs uppercase tracking-widest hover:opacity-70 transition-all active:scale-95 transform">Close</button>
+            </div>
+            
+            <div class="space-y-6 overflow-y-auto pr-2 custom-scrollbar">
+                <div>
+                    <h3 id="modal-heading-rem" class="text-[10px] uppercase tracking-widest mb-3 border-b pb-1">Remaining</h3>
+                    <ul id="remaining-list" class="space-y-3 text-sm"></ul>
+                </div>
+                <div>
+                    <h3 id="modal-heading-acc" class="text-[10px] uppercase tracking-widest mb-3 border-b pb-1">Accomplished</h3>
+                    <ul id="accomplished-list" class="space-y-3 text-sm opacity-60"></ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript Logic -->
+    <script>
+        const themes = [
+            {
+                name: "LIGHT", hex: "#FFFFFF", nextHex: "#000000",
+                bg: "bg-white", text: "text-slate-900", muted: "text-slate-600", sub: "text-slate-400",
+                formBg: "bg-slate-50 border-slate-200 shadow-xl",
+                formBorder: "border-slate-200/80",
+                presetActive: "bg-slate-900 text-white font-medium", presetInactive: "bg-slate-100 text-slate-500",
+                auraGradient: "from-slate-200/50 via-blue-100/30 to-purple-100/20",
+                addBtnBg: "bg-slate-900 text-white font-medium",
+                inputBg: "text-slate-900 placeholder-slate-400",
+                dotBg: "bg-slate-900",
+                customInputBg: "bg-white border-slate-300 text-slate-900",
+                toggleBtnStyle: "text-black hover:opacity-70",
+                modalBg: "bg-white/90 border-slate-200", modalHeading: "text-slate-400 border-slate-100"
+            },
+            {
+                name: "OLED BLACK", hex: "#000000", nextHex: "#FFFFFF",
+                bg: "bg-black", text: "text-white", muted: "text-neutral-300", sub: "text-neutral-500",
+                formBg: "bg-neutral-950/90 border-neutral-800 shadow-2xl",
+                formBorder: "border-neutral-800",
+                presetActive: "bg-white text-black font-medium", presetInactive: "bg-neutral-900 text-neutral-400",
+                auraGradient: "from-amber-600/20 via-rose-600/10 to-purple-600/10",
+                addBtnBg: "bg-white text-black font-medium",
+                inputBg: "text-neutral-100 placeholder-neutral-500",
+                dotBg: "bg-white",
+                customInputBg: "bg-neutral-900 border-neutral-700 text-white",
+                toggleBtnStyle: "text-white hover:opacity-70",
+                modalBg: "bg-neutral-900/90 border-neutral-800", modalHeading: "text-neutral-500 border-neutral-800"
+            }
+        ];
+
+        let currentThemeIndex = 0; // Starts at 0 (Minimal Light as primary default)
+
+        const appBody = document.getElementById('app-body');
+        const auraGlow = document.getElementById('aura-glow');
+        const addTaskForm = document.getElementById('add-task-form');
+        const addBtn = document.getElementById('add-btn');
+        const themeToggleBtn = document.getElementById('theme-toggle-btn');
+        const resetDefaultsBtn = document.getElementById('reset-defaults');
+        const topDot = document.getElementById('top-dot');
+        const durationContainerBorder = document.getElementById('duration-container-border');
+        const customMinsInput = document.getElementById('custom-mins-input');
+        const allClearTitle = document.getElementById('all-clear-title');
+        const allClearSub = document.getElementById('all-clear-sub');
+        const durationSelectorGroup = document.getElementById('duration-selector-group');
+        const customDurationContainer = document.getElementById('custom-duration-container');
+        const customPillBtn = document.getElementById('custom-pill-btn');
+        const customBackBtn = document.getElementById('custom-back-btn');
+        const durationBtns = document.querySelectorAll('.duration-btn');
+
+        const taskCard = document.getElementById('task-card');
+        const currentTaskText = document.getElementById('current-task-text');
+        const taskTimer = document.getElementById('task-timer');
+        const taskHint = document.getElementById('task-hint');
+        const taskContainer = document.getElementById('task-container');
+        const allClearState = document.getElementById('all-clear-state');
+        const taskCounter = document.getElementById('task-counter');
+        const newTaskInput = document.getElementById('new-task-input');
+
+        // Modal Elements
+        const taskListOverlay = document.getElementById('task-list-overlay');
+        const taskListModal = document.getElementById('task-list-modal');
+        const closeOverlayBtn = document.getElementById('close-overlay-btn');
+        const remainingList = document.getElementById('remaining-list');
+        const accomplishedList = document.getElementById('accomplished-list');
+        const modalHeadingRem = document.getElementById('modal-heading-rem');
+        const modalHeadingAcc = document.getElementById('modal-heading-acc');
+
+        function setTheme(index) {
+            currentThemeIndex = index;
+            const t = themes[index];
+            const nextTheme = themes[(index + 1) % themes.length];
+
+            appBody.className = `${t.bg} ${t.text} min-h-screen flex flex-col justify-between p-6 md:p-12 relative overflow-hidden transition-all duration-500`;
+            auraGlow.className = `w-[500px] h-[500px] rounded-full bg-gradient-to-tr ${t.auraGradient} blur-[120px] transition-all duration-700`;
+            addTaskForm.className = `flex flex-col space-y-3 ${t.formBg} rounded-2xl p-3 backdrop-blur-md transition-colors duration-500`;
+            durationContainerBorder.className = `flex items-center justify-between px-3 pt-2 border-t ${t.formBorder} text-xs ${t.sub}`;
+            addBtn.className = `${t.addBtnBg} text-xs px-5 py-2.5 rounded-xl tracking-wider uppercase transition-all hover:opacity-90 active:scale-95 transform`;
+            topDot.className = `inline-block w-1.5 h-1.5 rounded-full ${t.dotBg} animate-pulse`;
+
+            currentTaskText.className = `text-2xl md:text-4xl font-light leading-relaxed letter-spacing-wide ${t.text} uppercase transition-colors duration-300`;
+            taskTimer.className = `mt-4 text-sm md:text-base font-mono ${t.muted} tracking-widest transition-colors duration-300`;
+            taskHint.className = `mt-8 text-xs ${t.sub} tracking-widest uppercase transition-opacity duration-300`;
+            taskCounter.className = `${t.muted} cursor-pointer hover:opacity-70 active:scale-95 transform transition-all duration-200`;
+            newTaskInput.className = `flex-1 bg-transparent px-3 py-2 text-sm ${t.inputBg} focus:outline-none transition-colors duration-300`;
+            customMinsInput.className = `w-12 border text-center text-xs py-1 rounded-lg focus:outline-none transition-colors ${t.customInputBg}`;
+            allClearTitle.className = `text-xl md:text-2xl font-light tracking-[0.3em] ${t.sub} mb-4 transition-colors duration-300`;
+            allClearSub.className = `text-xs ${t.sub} tracking-widest transition-colors duration-300`;
+
+            // Display ONLY the hex code of the upcoming theme
+            themeToggleBtn.className = `font-mono text-xs transition-all uppercase tracking-wider font-bold cursor-pointer active:scale-95 transform ${t.toggleBtnStyle}`;
+            themeToggleBtn.textContent = nextTheme.hex;
+
+            resetDefaultsBtn.className = `${t.muted} hover:${t.text} transition-all uppercase text-[10px] tracking-widest cursor-pointer active:scale-95 transform`;
+
+            // Modal styling
+            const isModalOpen = taskListOverlay.classList.contains('opacity-100');
+            const modalTransform = isModalOpen ? 'scale-100 opacity-100 translate-y-0 translate-x-0' : 'scale-0 opacity-0 -translate-y-16 translate-x-16';
+            taskListModal.className = `w-full max-w-md shadow-2xl rounded-2xl p-6 max-h-[80vh] flex flex-col transform origin-top-right transition-all duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1.1)] backdrop-blur-xl ${t.modalBg} ${t.text} ${modalTransform}`;
+            modalHeadingRem.className = `text-[10px] uppercase tracking-widest mb-3 border-b pb-1 ${t.modalHeading}`;
+            modalHeadingAcc.className = `text-[10px] uppercase tracking-widest mb-3 border-b pb-1 ${t.modalHeading}`;
+
+            updatePresetButtonStyles();
+        }
+
+        function updatePresetButtonStyles() {
+            const t = themes[currentThemeIndex];
+            durationBtns.forEach(btn => {
+                if (btn.classList.contains('active-preset')) {
+                    btn.className = `duration-btn active-preset px-2.5 py-1 rounded-lg ${t.presetActive} text-[11px] transition-all active:scale-95 transform`;
+                } else if (btn.id !== 'custom-pill-btn') {
+                    btn.className = `duration-btn px-2.5 py-1 rounded-lg ${t.presetInactive} text-[11px] hover:opacity-80 transition-all active:scale-95 transform`;
+                }
+            });
+            if (customPillBtn.classList.contains('active-preset')) {
+                customPillBtn.className = `duration-btn active-preset px-2.5 py-1 rounded-lg ${t.presetActive} text-[11px] transition-all active:scale-95 transform`;
+            } else {
+                customPillBtn.className = `duration-btn px-2.5 py-1 rounded-lg ${t.presetInactive} text-[11px] hover:opacity-80 transition-all active:scale-95 transform`;
+            }
+        }
+
+        themeToggleBtn.addEventListener('click', () => {
+            currentThemeIndex = (currentThemeIndex + 1) % themes.length;
+            setTheme(currentThemeIndex);
+        });
+
+        durationBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const mins = btn.getAttribute('data-mins');
+                if (mins === 'custom') {
+                    durationSelectorGroup.classList.add('hidden');
+                    customDurationContainer.classList.remove('hidden');
+                    customDurationContainer.classList.add('flex');
+                    durationBtns.forEach(b => b.classList.remove('active-preset'));
+                    customPillBtn.classList.add('active-preset');
+                    selectedDurationMinutes = parseInt(customMinsInput.value) || 30;
+                    updatePresetButtonStyles();
+                } else {
+                    durationBtns.forEach(b => b.classList.remove('active-preset'));
+                    customPillBtn.classList.remove('active-preset');
+                    btn.classList.add('active-preset');
+                    selectedDurationMinutes = parseInt(mins);
+                    updatePresetButtonStyles();
+                }
+            });
+        });
+
+        customBackBtn.addEventListener('click', () => {
+            customDurationContainer.classList.remove('flex');
+            customDurationContainer.classList.add('hidden');
+            durationSelectorGroup.classList.remove('hidden');
+            const activePresetBtn = document.querySelector('.duration-btn[data-mins="15"]');
+            if (activePresetBtn) {
+                durationBtns.forEach(b => b.classList.remove('active-preset'));
+                customPillBtn.classList.remove('active-preset');
+                activePresetBtn.classList.add('active-preset');
+                selectedDurationMinutes = 15;
+            }
+            updatePresetButtonStyles();
+        });
+
+        customMinsInput.addEventListener('input', () => {
+            const val = parseInt(customMinsInput.value);
+            if (val > 0) {
+                selectedDurationMinutes = val;
+            }
+        });
+
+        let tasks = [
+            { text: "Review quarterly design system", duration: 15 * 60, remaining: 15 * 60 },
+            { text: "Draft launch announcement copy", duration: 25 * 60, remaining: 25 * 60 },
+            { text: "Refactor network interceptor", duration: 30 * 60, remaining: 30 * 60 },
+            { text: "Schedule team sync", duration: 10 * 60, remaining: 10 * 60 }
+        ];
+
+        let completedTasks = [];
+
+        let selectedDurationMinutes = 15;
+        let timerInterval = null;
+
+        function formatTime(totalSeconds) {
+            const mins = Math.floor(totalSeconds / 60);
+            const secs = totalSeconds % 60;
+            return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        }
+
+        function startTimer() {
+            if (timerInterval) clearInterval(timerInterval);
+            timerInterval = setInterval(() => {
+                if (tasks.length > 0) {
+                    if (tasks[0].remaining > 0) {
+                        tasks[0].remaining--;
+                        taskTimer.textContent = formatTime(tasks[0].remaining);
+                    } else {
+                        taskTimer.textContent = "TIME UP";
+                    }
+                }
+            }, 1000);
+        }
+
+        function render() {
+            taskCounter.textContent = `${tasks.length} remaining`;
+
+            if (tasks.length > 0) {
+                allClearState.classList.add('hidden');
+                taskContainer.classList.remove('hidden');
+                currentTaskText.textContent = tasks[0].text;
+                taskTimer.textContent = formatTime(tasks[0].remaining);
+                startTimer();
+            } else {
+                clearInterval(timerInterval);
+                taskContainer.classList.add('hidden');
+                allClearState.classList.remove('hidden');
+            }
+        }
+
+        function completeTask() {
+            if (tasks.length === 0) return;
+            
+            if (navigator.vibrate) {
+                navigator.vibrate(35);
+            }
+
+            taskCard.style.transform = 'translateX(100px)';
+            taskCard.style.opacity = '0';
+
+            setTimeout(() => {
+                const finishedTask = tasks.shift();
+                completedTasks.push(finishedTask);
+
+                taskCard.style.transition = 'none';
+                taskCard.style.transform = 'translateX(-100px)';
+                render();
+
+                void taskCard.offsetWidth;
+
+                taskCard.style.transition = 'transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease';
+                taskCard.style.transform = 'translateX(0)';
+                taskCard.style.opacity = '1';
+            }, 300);
+        }
+
+        let startX = 0;
+        let currentX = 0;
+        let isDragging = false;
+
+        taskContainer.addEventListener('touchstart', (e) => {
+            if (tasks.length === 0) return;
+            startX = e.touches[0].clientX;
+            isDragging = true;
+            taskCard.style.transition = 'none';
+        }, { passive: true });
+
+        taskContainer.addEventListener('touchmove', (e) => {
+            if (!isDragging || tasks.length === 0) return;
+            currentX = e.touches[0].clientX;
+            const diff = currentX - startX;
+            if (diff > 0) {
+                taskCard.style.transform = `translateX(${diff}px)`;
+                taskCard.style.opacity = `${Math.max(1 - diff / 300, 0.2)}`;
+            }
+        }, { passive: true });
+
+        taskContainer.addEventListener('touchend', () => {
+            if (!isDragging || tasks.length === 0) return;
+            isDragging = false;
+            const diff = currentX - startX;
+            taskCard.style.transition = 'transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease';
+            
+            if (diff > 100) {
+                completeTask();
+            } else {
+                taskCard.style.transform = 'translateX(0)';
+                taskCard.style.opacity = '1';
+            }
+            startX = 0;
+            currentX = 0;
+        });
+
+        taskContainer.addEventListener('mousedown', (e) => {
+            if (tasks.length === 0) return;
+            startX = e.clientX;
+            isDragging = true;
+            taskCard.style.transition = 'none';
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging || tasks.length === 0) return;
+            currentX = e.clientX;
+            const diff = currentX - startX;
+            if (diff > 0) {
+                taskCard.style.transform = `translateX(${diff}px)`;
+                taskCard.style.opacity = `${Math.max(1 - diff / 300, 0.2)}`;
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            if (!isDragging || tasks.length === 0) return;
+            isDragging = false;
+            const diff = currentX - startX;
+            taskCard.style.transition = 'transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease';
+            
+            if (diff > 100) {
+                completeTask();
+            } else {
+                taskCard.style.transform = 'translateX(0)';
+                taskCard.style.opacity = '1';
+            }
+            startX = 0;
+            currentX = 0;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' && tasks.length > 0) {
+                completeTask();
+            }
+        });
+
+        addTaskForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const val = newTaskInput.value.trim();
+            if (val) {
+                const totalSeconds = selectedDurationMinutes * 60;
+                tasks.push({ text: val, duration: totalSeconds, remaining: totalSeconds });
+                newTaskInput.value = '';
+                render();
+            }
+        });
+
+        // Overlay Logic
+        function completeTaskFromModal(index) {
+            const task = tasks.splice(index, 1)[0];
+            completedTasks.push(task);
+            render();
+            populateModal();
+        }
+
+        function revertTaskFromModal(index) {
+            const task = completedTasks.splice(index, 1)[0];
+            tasks.push(task);
+            render();
+            populateModal();
+        }
+
+        function populateModal() {
+            remainingList.innerHTML = '';
+            accomplishedList.innerHTML = '';
+            
+            if (tasks.length === 0) {
+                remainingList.innerHTML = '<li class="italic opacity-50">No tasks remaining.</li>';
+            } else {
+                tasks.forEach((t, i) => {
+                    const li = document.createElement('li');
+                    li.className = 'flex justify-between items-center';
+                    li.innerHTML = `
+                        <span class="truncate pr-2"><span class="opacity-50 mr-2">${i+1}.</span> ${t.text}</span>
+                        <div class="flex items-center space-x-3 shrink-0">
+                            <span class="text-xs opacity-70">${Math.round(t.duration/60)}m</span>
+                            <button onclick="completeTaskFromModal(${i})" class="text-[10px] uppercase tracking-widest border border-current rounded px-2 py-1 opacity-40 hover:opacity-100 active:scale-95 transition-all cursor-pointer">Done</button>
+                        </div>
+                    `;
+                    remainingList.appendChild(li);
+                });
+            }
+            
+            if (completedTasks.length === 0) {
+                accomplishedList.innerHTML = '<li class="italic opacity-50">No tasks completed yet.</li>';
+            } else {
+                completedTasks.forEach((t, i) => {
+                    const li = document.createElement('li');
+                    li.className = 'flex justify-between items-center opacity-60 hover:opacity-100 transition-opacity';
+                    li.innerHTML = `
+                        <span class="truncate pr-2 line-through"><span class="opacity-50 mr-2">${i+1}.</span> ${t.text}</span>
+                        <div class="flex items-center space-x-3 shrink-0">
+                            <button onclick="revertTaskFromModal(${i})" class="text-[10px] uppercase tracking-widest border border-current rounded px-2 py-1 opacity-40 hover:opacity-100 active:scale-95 transition-all cursor-pointer">Undo</button>
+                        </div>
+                    `;
+                    accomplishedList.appendChild(li);
+                });
+            }
+        }
+
+        taskCounter.addEventListener('click', () => {
+            populateModal();
+            taskListOverlay.classList.remove('hidden');
+            taskListOverlay.classList.add('flex');
+            // Small delay to allow display:flex to apply before opacity transition
+            setTimeout(() => {
+                taskListOverlay.classList.remove('opacity-0');
+                taskListOverlay.classList.add('opacity-100');
+                taskListModal.classList.remove('scale-0', 'opacity-0', '-translate-y-16', 'translate-x-16');
+                taskListModal.classList.add('scale-100', 'opacity-100', 'translate-y-0', 'translate-x-0');
+            }, 10);
+        });
+        
+        function closeOverlay() {
+            taskListOverlay.classList.remove('opacity-100');
+            taskListOverlay.classList.add('opacity-0');
+            taskListModal.classList.remove('scale-100', 'opacity-100', 'translate-y-0', 'translate-x-0');
+            taskListModal.classList.add('scale-0', 'opacity-0', '-translate-y-16', 'translate-x-16');
+            setTimeout(() => {
+                taskListOverlay.classList.remove('flex');
+                taskListOverlay.classList.add('hidden');
+            }, 500);
+        }
+
+        closeOverlayBtn.addEventListener('click', closeOverlay);
+        taskListOverlay.addEventListener('click', (e) => {
+            if (e.target === taskListOverlay) closeOverlay();
+        });
+
+        resetDefaultsBtn.addEventListener('click', () => {
+            tasks = [
+                { text: "Review quarterly design system", duration: 15 * 60, remaining: 15 * 60 },
+                { text: "Draft launch announcement copy", duration: 25 * 60, remaining: 25 * 60 },
+                { text: "Refactor network interceptor", duration: 30 * 60, remaining: 30 * 60 },
+                { text: "Schedule team sync", duration: 10 * 60, remaining: 10 * 60 }
+            ];
+            completedTasks = [];
+            render();
+        });
+
+        setTheme(0);
+        render();
+    </script>
+</body>
+</html>
