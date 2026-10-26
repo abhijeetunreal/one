@@ -45,12 +45,41 @@ jobs:
       - name: Init Android project
         run: cargo tauri android init
 
-      # Debug-signed build = installable on any phone without a keystore
-      - name: Build APK
-        run: cargo tauri android build --apk --debug --target aarch64 armv7
+      # Final Release Build (Size-optimized, LTO, stripped symbols)
+      - name: Build Release APK
+        run: cargo tauri android build --apk --target aarch64 armv7
 
-      - name: Upload APK
+      # Sign release APKs so they install directly on any phone without keystore errors
+      - name: Sign Release APK
+        run: |
+          mkdir -p release-apks
+          # Generate signing keystore
+          keytool -genkey -v -keystore release.keystore -alias one -keyalg RSA -keysize 2048 -validity 10000 -storepass "onefocuspass" -keypass "onefocuspass" -dname "CN=One Single Focus, OU=One, O=One, L=City, S=State, C=US"
+          
+          # Find all APKs and sign them with apksigner
+          find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | while read -r apk; do
+            echo "Signing $apk..."
+            base=$(basename "$apk" .apk)
+            clean_name="${base/-unsigned/}"
+            out="release-apks/${clean_name}.apk"
+            ${ANDROID_HOME}/build-tools/34.0.0/apksigner sign --ks release.keystore --ks-pass pass:onefocuspass --key-pass pass:onefocuspass --out "$out" "$apk"
+          done
+          
+          # Provide One-final.apk convenience copy
+          if compgen -G "release-apks/*universal*.apk" > /dev/null; then
+            cp release-apks/*universal*.apk release-apks/One-final.apk
+          elif compgen -G "release-apks/*arm64*.apk" > /dev/null; then
+            cp release-apks/*arm64*.apk release-apks/One-final.apk
+          else
+            first_apk=$(ls release-apks/*.apk | head -n 1)
+            cp "$first_apk" release-apks/One-final.apk
+          fi
+          
+          echo "Release APKs built and signed successfully:"
+          ls -lh release-apks/
+
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: One-apk
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          name: One-final-release-apk
+          path: release-apks/*.apk
